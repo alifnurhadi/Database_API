@@ -1,9 +1,9 @@
 from fastapi import FastAPI
 import polars as pl
 from pydantic import BaseModel
-from typing import Generator, Optional
+from typing import AsyncGenerator, Generator, Optional
 import asyncpg
-
+from atribute import DB_alif
 
 class User(BaseModel):
     name : str
@@ -17,9 +17,6 @@ class Responses(BaseModel):
 
 class Database:
     async def __init__(self, version :str = None):
-        from dotenv import load_dotenv
-        load_dotenv()
-        import os
 
         if not version:
             raise ValueError ('it need to define what database are going to used')
@@ -28,36 +25,57 @@ class Database:
             raise TypeError (' put some string format connection for this job')
         
         if version in {'pg1','pg2','pg3'}:
-
+            db = DB_alif()
             if version == 'pg1':
-                self.db = 'some postgres string'
+                self.db = db.constring(databasename='alif_db' , host='1234')
             elif version == 'pg2':
-                self.db = 'some postgres string'
+                self.db = db.constring(databasename='alif_db' , host='1234')
             elif version == 'pg3':
-                self.db = 'some postgres string'
+                self.db = db.constring(databasename='alif_db' , host='1234')
         else :
             raise ValueError(f"Unsupported database version: {version}")
 
 class Connect(Database):
     def __init__(self, version: str = 'pg1'):
         super().__init__(version)
+        self.pool = None # additional i dont will work or not 
 
     async def connect(self):
-        pool = await asyncpg.create_pool(dsn=self.db)
-        try:
-            yield pool
-        finally:
-            await pool.close()
+        if not self.pool:
+            self.pool = await asyncpg.create_pool(dsn=self.db)
+
+    async def close(self):
+        if self.pool:
+            await self.pool.close()
+            self.pool = None
     
+    # OG
     async def fetch_some(self,query):
         async with self.connect() as pool:
             async with pool.acquire() as con:
                 return await con.fetchrow(query)
             
+    #opsi
+    async def fetch_some(self, query: str) -> AsyncGenerator[dict, None]:
+        await self.connect()  # Ensures the pool is initialized
+        async with self.pool.acquire() as con:
+            # Fetch multiple rows to simulate a generator-like output
+            rows = await con.fetch(query)
+            for row in rows:
+                yield dict(row)
+    
+    # OG
     async def execute_query(self, query: str, params: Optional[dict] = None):
         async with self.connect() as pool:
             async with pool.acquire() as con:
                 return await con.execute(query, *params)
+            
+    # opsi
+    async def execute_query(self, query: str, params: Optional[tuple] = None) -> str:
+        await self.connect()  # Ensures the pool is initialized
+        async with self.pool.acquire() as con:
+            # Execute the query, params must be a tuple for *params
+            return await con.execute(query, *params) if params else await con.execute(query)
 
 
 app = FastAPI()
