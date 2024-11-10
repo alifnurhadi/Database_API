@@ -1,22 +1,45 @@
-from fastapi import FastAPI
+from datetime import datetime
+from fastapi import FastAPI,  HTTPException
 import polars as pl
-from pydantic import BaseModel
-from typing import AsyncGenerator, Generator, Optional
+from pydantic import BaseModel , Field
+from typing import Any, AsyncGenerator, Dict, Generator, List, Optional
+from contextlib import asynccontextmanager
 import asyncpg
 from atribute import DB_alif
 
-class User(BaseModel):
-    name : str
-    email : str
-    identity : int
-    password : any
 
-class Responses(BaseModel):
-    table : dict   
+class BaseResponse(BaseModel):
+    status: str = Field(default="success")
+    timestamp: datetime = Field(default_factory=datetime.timestamp)
+
+class DataResponse(BaseResponse):
+    '''
+        {
+    "status": "success",
+    "timestamp": datetime,  # Timestamp will vary
+    "data": [
+        {"id": 1, "name": "Item 1"},
+        {"id": 2, "name": "Item 2"}
+    ],
+    "total_records": 2
+    }
+    '''
+    data: List[Dict[str, Any]] = Field(default_factory=list)
+    total_records: int = Field(default=0)
+    
+class MessageResponse(BaseResponse):
+    '''{
+        "status": "success",
+        "timestamp": datetime,  # Timestamp will vary
+        "message": " some message "
+        }
+    '''
+    message: str
+
 
 
 class Database:
-    async def __init__(self, version :str = None):
+    def __init__(self, version :str = None):
 
         if not version:
             raise ValueError ('it need to define what database are going to used')
@@ -35,128 +58,146 @@ class Database:
         else :
             raise ValueError(f"Unsupported database version: {version}")
 
-class Connect(Database):
-    def __init__(self, version: str = 'pg1'):
-        super().__init__(version)
-        self.pool = None # additional i dont will work or not 
-
-    async def connect(self):
+    @asynccontextmanager
+    async def start_pool(self)-> Generator[asyncpg.Pool , None , None ]:
         if not self.pool:
-            self.pool = await asyncpg.create_pool(dsn=self.db)
+            try:
+                self.pool = await asyncpg.create_pool(dsn=self.db , min_size=2 , max_size=5)
+                return self.pool
+            except HTTPException:
+                raise HTTPException(status_code=505 , detail='can"t create a pool connection, try another url')
 
     async def close(self):
         if self.pool:
-            await self.pool.close()
+            await self.pool.release()
             self.pool = None
+
+    @asynccontextmanager
+    async def connect(self):
+        async with self.start_pool() as pools:
+            async with pools.acquire() as conn:
+                yield conn
     
-    # OG
-    async def fetch_some(self,query):
-        async with self.connect() as pool:
-            async with pool.acquire() as con:
-                return await con.fetchrow(query)
+    async def fetch(self, query: str, params: tuple = None) -> List[Dict[str, Any]]:
+        async with self.connect() as conn:
+            try:
+                rows = await conn.fetch(query, *params) if params else await conn.fetch(query)
+                return [dict(row) for row in rows]
+            except asyncpg.PostgresError as e:
+                raise HTTPException(status_code=400, detail=f"Query execution failed: {str(e)}")
+                    
+    async def execute(self, query: str ,params: tuple = None) -> str:
+        async with self.connect() as conn:
+            try:
+                result = await conn.execute(query, *params) if params else await conn.execute(query)
+                return result
+            except asyncpg.PostgresError as e:
+                raise HTTPException(status_code=400, detail=f"Query execution failed: {str(e)}")
+
+
+class ParquetData:
+    def __init__(self , newpath:str=None , anotherpath:str = None , partition_col:list[str,str]=None) -> None:
+        self.existpath = './data/sales.parquet'
+        self.newpath = newpath
+        self.another = anotherpath
+        self.partition = partition_col
+        self._sql_env = None
+
+    @property
+    async def sql_env(self)->pl.SQLContext:
+        if self._sql_env is None:
+            data = pl.scan_parquet(self.existpath)
+            self._sql_env = pl.SQLContext()
+            self._sql_env.register('df', data)
+        return self._sql_env
+
+    async def read(self , query:str):
+        sql_context = await self.sql_env
+        try:
+            query = query or 'select * from df'
+            # Chain methods after awaiting the execute
+            result: pl.DataFrame = await sql_context.execute(query)
+
+            return result.to_dicts()
+        except:
+            raise HTTPException(status_code=500,detail=f"Failed to execute query"  )
+
+    async def write(self,newdata:dict, sendto_newpath:bool=False , sendto_another:bool=False)->None:
+        data = pl.scan_parquet(self.existpath)
+        new = pl.LazyFrame(newdata)
+        
+        try:
+            concat = pl.concat([data,new]).collect(streaming=True)
+            output_path = (
+                self.newpath if sendto_newpath
+                else self.another if sendto_another
+                else self.existpath
+            )
             
-    #opsi
-    async def fetch_some(self, query: str) -> AsyncGenerator[dict, None]:
-        await self.connect()  # Ensures the pool is initialized
-        async with self.pool.acquire() as con:
-            # Fetch multiple rows to simulate a generator-like output
-            rows = await con.fetch(query)
-            for row in rows:
-                yield dict(row)
-    
-    # OG
-    async def execute_query(self, query: str, params: Optional[dict] = None):
-        async with self.connect() as pool:
-            async with pool.acquire() as con:
-                return await con.execute(query, *params)
-            
-    # opsi
-    async def execute_query(self, query: str, params: Optional[tuple] = None) -> str:
-        await self.connect()  # Ensures the pool is initialized
-        async with self.pool.acquire() as con:
-            # Execute the query, params must be a tuple for *params
-            return await con.execute(query, *params) if params else await con.execute(query)
+            concat.write_parquet(
+                output_path,
+                compression="zstd",
+                partition_by=self.partition
+            )
+        except Exception as e :
+            raise Exception(f'Failed to load new data, there"s an issue on {e}')
 
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initialize services
+    app.state.db = Database('pg1')
+    app.state.db2 = Database('pg2')
+    app.state.pqt = ParquetData(
+        newpath='./data/marketing.parquet',
+        anotherpath='/data/summary.parquet'
+    )
+    # Starting-up
+    await app.state.db.start_pool()
+    yield
+    # Shuting-down
+    await app.state.db.close()
 
+app = FastAPI(lifespan=lifespan)
 
-@app.get('/get')
-async def fetch_db(Query:str):
-    return await Database.connect().fetchrow(Query)
-
-@app.get('/pqt')
-async def get_data(some_condition:str|int = None):
-    data:pl.DataFrame = pl.read_parquet('someparquet file')
-    data:pl.DataFrame = data.filter(some_condition)
-    return await data.to_dicts() ## i hope this line is similar when we use to dict and orient format.
-
-@app.post('/push')
-async def insert_db(query:str):
-    return await Database.connect().executemany(query)
-
-@app.post('p.pqt')
-async def push_data(some_data:dict):
-    old:pl.LazyFrame = pl.scan_parquet('someparquet')
-    new:pl.LazyFrame = pl.LazyFrame(some_data)
-    combine : pl.LazyFrame = pl.concat([old,new])
-    return await combine.sink_parquet('someparquet')
-
-
-@app.delete('/remove')
-async def rm_db(query:str):
-    return await query
-
-@app.delete('rm.pqt')
-async def remove(some_condition):
-    data : pl.LazyFrame = pl.scan_parquet('someparquet')
-    data = data.drop(some_condition)
-    return await data.sink_parquet('someparquet')
-
-
-'''
-
-options 
-
-@app.get('/get')
-async def fetch_db(query: str):
+@app.get('/get',response_model= DataResponse)
+async def fetch_db(queries:str,params: tuple = None):
     try:
-        data = await Connect().fetch_some(query)
+        data = await app.state.db.fetch(queries,params)
         if not data:
-            raise HTTPException(status_code=404, detail="Data not found")
-        return data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            raise ValueError('put some connection string value')
+        return DataResponse(data=data, total_records=len(data))
+    except:
+        raise HTTPException(status_code=505 ,detail="can't fetch data from the databases, make sure the query are having the appropiate syntax")
 
-
-@app.get('/pqt')
-async def get_data(some_condition: Optional[str] = None):
+@app.get('/pqt',response_model= DataResponse)
+async def get_data(queries :str = None):
     try:
-        data: pl.DataFrame = pl.read_parquet('someparquet')
-        if some_condition:
-            data = data.filter(pl.col(some_condition).is_not_null())
-        return data.to_dicts()
+        if queries:
+            data = await app.state.pqt.read(queries)
+
+        return DataResponse(
+            data=data , total_records=len(data)
+        )
+    
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post('/push')
-async def insert_db(query: str):
+async def insert_db(query: str, params: tuple = None):
     try:
-        result = await Connect().execute_query(query)
-        return {"status": "success", "result": result}
+        result = await app.state.db.execute(query , params)
+        return MessageResponse(message=f"Query executed successfully: {result}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post('/p.pqt')
+@app.post('/pqt')
 async def push_data(some_data: dict):
     try:
-        old: pl.LazyFrame = pl.scan_parquet('someparquet')
-        new: pl.LazyFrame = pl.LazyFrame(some_data)
-        combined: pl.LazyFrame = pl.concat([old, new])
-        combined.write_parquet('someparquet')
-        return {"status": "success", "message": "Data added successfully"}
+        await app.state.pqt.write(some_data)
+        return MessageResponse(message="Data added successfully")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -164,21 +205,8 @@ async def push_data(some_data: dict):
 @app.delete('/remove')
 async def rm_db(query: str):
     try:
-        result = await Connect().execute_query(query)
-        return {"status": "success", "result": result}
+        result = await app.state.db.execute(query)
+        return MessageResponse(message=f"Delete executed successfully: {result}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.delete('/rm.pqt')
-async def remove(some_condition: str):
-    try:
-        data: pl.LazyFrame = pl.scan_parquet('someparquet')
-        data = data.filter(pl.col(some_condition).is_not_null())  # Assuming it's a condition to drop rows
-        data.write_parquet('someparquet')
-        return {"status": "success", "message": "Data removed successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-'''
