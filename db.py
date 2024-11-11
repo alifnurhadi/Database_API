@@ -1,8 +1,8 @@
 from datetime import datetime
-from fastapi import FastAPI,  HTTPException
+from fastapi import FastAPI,  HTTPException ,Query
 import polars as pl
 from pydantic import BaseModel , Field
-from typing import Any, AsyncGenerator, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional
 from contextlib import asynccontextmanager
 import asyncpg
 from atribute import DB_alif
@@ -10,7 +10,7 @@ from atribute import DB_alif
 
 class BaseResponse(BaseModel):
     status: str = Field(default="success")
-    timestamp: datetime = Field(default_factory=datetime.timestamp)
+    timestamp: datetime = Field(default_factory=datetime.now)
 
 class DataResponse(BaseResponse):
     '''
@@ -40,6 +40,7 @@ class MessageResponse(BaseResponse):
 
 class Database:
     def __init__(self, version :str = None):
+        self.pool = None
 
         if not version:
             raise ValueError ('it need to define what database are going to used')
@@ -58,7 +59,7 @@ class Database:
         else :
             raise ValueError(f"Unsupported database version: {version}")
 
-    @asynccontextmanager
+    # @asynccontextmanager
     async def start_pool(self)-> Generator[asyncpg.Pool , None , None ]:
         if not self.pool:
             try:
@@ -69,14 +70,15 @@ class Database:
 
     async def close(self):
         if self.pool:
-            await self.pool.release()
+            await self.pool.close()
             self.pool = None
 
     @asynccontextmanager
     async def connect(self):
-        async with self.start_pool() as pools:
-            async with pools.acquire() as conn:
-                yield conn
+        if not self.pool:
+            await self.start_pool()
+        async with self.pool.acquire() as conn:
+            yield conn
     
     async def fetch(self, query: str, params: tuple = None) -> List[Dict[str, Any]]:
         async with self.connect() as conn:
@@ -108,19 +110,25 @@ class ParquetData:
         if self._sql_env is None:
             data = pl.scan_parquet(self.existpath)
             self._sql_env = pl.SQLContext()
-            self._sql_env.register('df', data)
+            self._sql_env.register("df", data)
+        else:
+            # Optionally, reset or invalidate the cache after a certain time or event
+            self._sql_env = None  # Force reload on next access
         return self._sql_env
 
-    async def read(self , query:str):
-        sql_context = await self.sql_env
+    async def read(self , query:str=None):
+        # sql_context = await self.sql_env
         try:
-            query = query or 'select * from df'
-            # Chain methods after awaiting the execute
-            result: pl.DataFrame = await sql_context.execute(query)
-
-            return result.to_dicts()
-        except:
-            raise HTTPException(status_code=500,detail=f"Failed to execute query"  )
+            query = query or 'SELECT * FROM df'
+            # Directly load the Parquet file for each query
+            sql_context = pl.SQLContext()
+            data = pl.scan_parquet(self.existpath)
+            sql_context.register("df", data)
+            result: pl.LazyFrame = sql_context.execute(query)
+            data = result.collect().to_dicts()
+            return data
+        except Exception as e :
+            raise HTTPException(status_code=500, detail=f"Failed to execute query: {str(e)}")
 
     async def write(self,newdata:dict, sendto_newpath:bool=False , sendto_another:bool=False)->None:
         data = pl.scan_parquet(self.existpath)
@@ -150,7 +158,7 @@ async def lifespan(app: FastAPI):
     app.state.db2 = Database('pg2')
     app.state.pqt = ParquetData(
         newpath='./data/marketing.parquet',
-        anotherpath='/data/summary.parquet'
+        anotherpath='./data/summary.parquet'
     )
     # Starting-up
     await app.state.db.start_pool()
@@ -161,24 +169,30 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 @app.get('/get',response_model= DataResponse)
-async def fetch_db(queries:str,params: tuple = None):
+async def fetch_db(
+    queries: str = Query(..., description="SQL query to execute"),
+    params: Optional[str] = Query(None, description="First parameter (optional)")
+    ):
     try:
-        data = await app.state.db.fetch(queries,params)
+        data = await app.state.db.fetch(queries, params if params else None)
+        
         if not data:
-            raise ValueError('put some connection string value')
+            return DataResponse(data=[], total_records=0)
+            
         return DataResponse(data=data, total_records=len(data))
     except:
         raise HTTPException(status_code=505 ,detail="can't fetch data from the databases, make sure the query are having the appropiate syntax")
 
 @app.get('/pqt',response_model= DataResponse)
-async def get_data(queries :str = None):
+async def get_data(queries :Optional[str]=None):
     try:
-        if queries:
-            data = await app.state.pqt.read(queries)
+        queries  = queries or 'SELECT * FROM df'
+        data = await app.state.pqt.read(queries)
 
         return DataResponse(
             data=data , total_records=len(data)
         )
+        
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
